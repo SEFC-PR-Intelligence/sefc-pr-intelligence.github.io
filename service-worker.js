@@ -1,10 +1,10 @@
 // SEFC Matchday Intelligence - Service Worker
-// 오프라인 작동을 위한 캐싱 전략
+// 자동 갱신 강화: 새 버전 발견 시 즉시 적용
 
-const CACHE_VERSION = 'sefc-v1';
+// CACHE_VERSION을 빌드마다 갱신
+const CACHE_VERSION = 'v2026-05-09-r11';
 const CACHE_NAME = `sefc-cache-${CACHE_VERSION}`;
 
-// 앱 셸 — 첫 설치 시 캐시할 파일들
 const APP_SHELL = [
   './',
   './index.html',
@@ -13,54 +13,53 @@ const APP_SHELL = [
   './icon-512.png',
 ];
 
-// 설치 — 앱 셸 캐싱
+// 설치 — 앱 셸 캐싱 + 즉시 활성화
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(APP_SHELL).catch((err) => {
-        // 일부 파일(예: 아이콘) 누락 시에도 설치 진행
         console.warn('[SW] 일부 파일 캐싱 실패:', err);
       });
     }).then(() => self.skipWaiting())
   );
 });
 
-// 활성화 — 옛 캐시 정리
+// 활성화 — 옛 캐시 정리 + 모든 클라이언트 즉시 제어
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) => {
       return Promise.all(
-        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
+        keys.filter((key) => key !== CACHE_NAME).map((key) => {
+          console.log('[SW] 옛 캐시 삭제:', key);
+          return caches.delete(key);
+        })
       );
-    }).then(() => self.clients.claim())
+    }).then(() => self.clients.claim()).then(() => {
+      return self.clients.matchAll({ type: 'window' }).then((clients) => {
+        clients.forEach((client) => {
+          client.postMessage({ type: 'SW_UPDATED', version: CACHE_VERSION });
+        });
+      });
+    })
   );
 });
 
-// fetch — 캐시 우선, 없으면 네트워크
+// fetch — HTML은 Network First, 정적 자산은 Cache First
 self.addEventListener('fetch', (event) => {
-  // GET 요청만 처리
   if (event.request.method !== 'GET') return;
   
-  // 같은 출처(origin) 요청만 처리
   const url = new URL(event.request.url);
   if (url.origin !== location.origin) return;
   
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) {
-        // 캐시 있으면 즉시 반환 + 백그라운드에서 업데이트
-        fetch(event.request).then((fresh) => {
-          if (fresh && fresh.status === 200) {
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, fresh.clone());
-            });
-          }
-        }).catch(() => {/* 오프라인이면 무시 */});
-        return cached;
-      }
-      
-      // 캐시 없으면 네트워크 시도
-      return fetch(event.request).then((response) => {
+  const isHTML = event.request.mode === 'navigate' || 
+                 event.request.destination === 'document' ||
+                 url.pathname.endsWith('.html') ||
+                 url.pathname === '/' ||
+                 url.pathname.endsWith('/');
+  
+  if (isHTML) {
+    event.respondWith(
+      fetch(event.request).then((response) => {
         if (response && response.status === 200) {
           const responseClone = response.clone();
           caches.open(CACHE_NAME).then((cache) => {
@@ -69,9 +68,43 @@ self.addEventListener('fetch', (event) => {
         }
         return response;
       }).catch(() => {
-        // 네트워크 실패 + 캐시도 없음 → 오프라인 폴백
-        return caches.match('./index.html');
-      });
+        return caches.match(event.request).then((cached) => {
+          return cached || caches.match('./index.html');
+        });
+      })
+    );
+    return;
+  }
+  
+  event.respondWith(
+    caches.match(event.request).then((cached) => {
+      if (cached) {
+        fetch(event.request).then((fresh) => {
+          if (fresh && fresh.status === 200) {
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, fresh.clone());
+            });
+          }
+        }).catch(() => {});
+        return cached;
+      }
+      
+      return fetch(event.request).then((response) => {
+        if (response && response.status === 200) {
+          const responseClone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => {
+            cache.put(event.request, responseClone);
+          });
+        }
+        return response;
+      }).catch(() => caches.match('./index.html'));
     })
   );
+});
+
+// 메시지 — 클라이언트가 SKIP_WAITING 요청 시
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
